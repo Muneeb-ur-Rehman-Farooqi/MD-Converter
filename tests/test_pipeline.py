@@ -348,11 +348,12 @@ def test_writer_permission_error_is_failed_with_locked_message(
     assert result.error_message == FileLockedError().user_message
 
 
-def test_default_convert_has_no_readers(tmp_path: Path) -> None:
-    """Prove the module-level convert() returns FAILED without raising."""
+def test_default_convert_fails_for_unregistered_pair(tmp_path: Path) -> None:
+    """Prove the module-level convert() returns FAILED without raising for pairs
+    the default pipeline does not register yet (PDF -> DOCX)."""
     source = _make_pdf(tmp_path / "report.pdf")
     result = default_convert(
-        ConversionRequest(source=source, target_format=DocFormat.MD)
+        ConversionRequest(source=source, target_format=DocFormat.DOCX)
     )
     assert result.status is ConversionStatus.FAILED
     assert result.error_message

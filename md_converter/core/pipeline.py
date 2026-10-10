@@ -232,13 +232,23 @@ class Pipeline:
 
 
 def build_default_pipeline() -> Pipeline:
-    """Return the default pipeline.
+    """Return the default pipeline with the PDF reader and MD writer registered.
 
     Real readers and writers are registered here as each feature (F1 to F5) is
-    built. It is a function, not a module-level object, so importing
-    pipeline.py has no side effects.
+    built. The PDF reader and Markdown writer imports are done inside this
+    function on purpose: importing pymupdf takes noticeable time, and importing
+    pipeline.py must stay cheap and free of side effects.
     """
-    return Pipeline(readers={}, writers={}, transforms=(math_hook,))
+    # Imported here rather than at the top of the file so importing
+    # pipeline.py does not pull in pymupdf.
+    from md_converter.core.readers import pdf_reader
+    from md_converter.core.writers import md_writer
+
+    return Pipeline(
+        readers={DocFormat.PDF: pdf_reader},
+        writers={DocFormat.MD: md_writer},
+        transforms=(math_hook,),
+    )
 
 
 def convert(
