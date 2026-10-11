@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 from pathlib import Path
 
@@ -24,7 +25,11 @@ from md_converter.core.pipeline import Pipeline
 from md_converter.core.readers import pdf_reader
 from md_converter.core.readers.pdf_reader import (
     _bullet_to_markdown,
+    _collapse_letter_spacing,
+    _heading_level,
     _join_block_lines,
+    _join_line_spans,
+    _numbering_depth,
     _round_size,
     _spans_to_markdown,
     _table_to_markdown,
@@ -235,6 +240,101 @@ def test_spans_to_markdown_merges_consecutive_bold_spans() -> None:
     assert _spans_to_markdown(spans) == "**foobar**"
 
 
+# --------------------- new pure helpers (heading design) ------------------- #
+
+
+def test_numbering_depth() -> None:
+    """Prove _numbering_depth extracts the dot-separated group count."""
+    assert _numbering_depth("1.1 Digital Computers") == 2
+    assert _numbering_depth("1.6.3 The Reflected Code") == 3
+    assert _numbering_depth("3. Methods") == 1
+    assert _numbering_depth("2 Intro") == 1
+    assert _numbering_depth("Binary Systems") is None
+    assert _numbering_depth("1.1Digital") is None
+    assert _numbering_depth("") is None
+
+
+def test_collapse_letter_spacing() -> None:
+    """Prove _collapse_letter_spacing only collapses single-character tokens."""
+    assert _collapse_letter_spacing("C h a p t e r") == "Chapter"
+    assert _collapse_letter_spacing("Binary Systems") == "Binary Systems"
+    assert _collapse_letter_spacing("A B C") == "A B C"
+    assert _collapse_letter_spacing("I am a b c d") == "I am a b c d"
+
+
+def test_heading_level_with_body_size_10() -> None:
+    """Prove _heading_level returns the expected level or None."""
+    assert _heading_level(19.5, 10.0, "Binary Systems") == 1
+    assert _heading_level(15.0, 10.0, "Chapter") == 2
+    assert _heading_level(11.0, 10.0, "1.1 Digital Computers") == 2
+    assert _heading_level(11.0, 10.0, "1.6.3 The Reflected Code") == 3
+    assert _heading_level(11.0, 10.0, "Plain Heading") == 3
+    assert _heading_level(10.5, 10.0, "Intro") == 3
+    assert _heading_level(10.0, 10.0, "Body") is None
+    assert _heading_level(90.0, 10.0, "1") is None
+    assert _heading_level(9.0, 10.0, "Preface xi") is None
+
+
+# ------------------ new pure helpers (emphasis merge design) --------------- #
+
+
+def test_join_line_spans_italic_hyphenation() -> None:
+    """Prove the italic hyphenation case produces *analog computer*."""
+    italic = pymupdf.TEXT_FONT_ITALIC
+    lines = [
+        [{"text": "An ", "flags": 0}, {"text": "ana-", "flags": italic}],
+        [
+            {"text": "log computer", "flags": italic},
+            {"text": " performs", "flags": 0},
+        ],
+    ]
+    result = _spans_to_markdown(_join_line_spans(lines))
+    assert result == "An *analog computer* performs"
+
+
+def test_join_line_spans_italic_same_state() -> None:
+    """Prove two italic lines merge into one italic run."""
+    italic = pymupdf.TEXT_FONT_ITALIC
+    lines = [
+        [{"text": "one", "flags": italic}],
+        [{"text": "two", "flags": italic}],
+    ]
+    assert _spans_to_markdown(_join_line_spans(lines)) == "*one two*"
+
+
+def test_join_line_spans_plain_hyphenation() -> None:
+    """Prove plain hyphenated lines join without a hyphen or space."""
+    lines = [[{"text": "meth-", "flags": 0}], [{"text": "od", "flags": 0}]]
+    assert _spans_to_markdown(_join_line_spans(lines)) == "method"
+
+
+def test_join_line_spans_hyphen_uppercase_not_merged() -> None:
+    """Prove a hyphen followed by an uppercase letter is not merged."""
+    lines = [[{"text": "pre-", "flags": 0}], [{"text": "Pre", "flags": 0}]]
+    assert _spans_to_markdown(_join_line_spans(lines)) == "pre- Pre"
+
+
+def test_join_line_spans_hyphen_after_digit_not_merged() -> None:
+    """Prove a hyphen after a non-letter is not treated as a line break."""
+    lines = [[{"text": "1-", "flags": 0}], [{"text": "2", "flags": 0}]]
+    assert _spans_to_markdown(_join_line_spans(lines)) == "1- 2"
+
+
+def test_join_line_spans_does_not_mutate_input() -> None:
+    """Prove _join_line_spans never mutates the caller's span dicts."""
+    italic = pymupdf.TEXT_FONT_ITALIC
+    lines = [
+        [{"text": "An ", "flags": 0}, {"text": "ana-", "flags": italic}],
+        [
+            {"text": "log computer", "flags": italic},
+            {"text": " performs", "flags": 0},
+        ],
+    ]
+    original = copy.deepcopy(lines)
+    _join_line_spans(lines)
+    assert lines == original
+
+
 # ----------------------------- reader tests -------------------------------- #
 
 
@@ -439,3 +539,68 @@ def test_end_to_end_pipeline_blank_pdf_fails_with_ocr_message(
 
     assert result.status is ConversionStatus.FAILED
     assert "OCR" in result.error_message
+
+
+# ------------------------- new integration tests --------------------------- #
+
+
+def test_numbering_headings_are_detected(tmp_path: Path) -> None:
+    """Prove section-numbered headings produce #, ## and ### lines."""
+    source = tmp_path / "a.pdf"
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text(
+            (72, 72), "1.1 Introduction", fontsize=12, fontname="helv"
+        )
+        page.insert_text(
+            (72, 130), "1.1.1 Details", fontsize=12, fontname="helv"
+        )
+        y = 200
+        for i in range(8):
+            page.insert_text(
+                (72, y),
+                f"Body line {i + 1} here.",
+                fontsize=11,
+                fontname="helv",
+            )
+            y += 16
+        doc.save(source)
+    finally:
+        doc.close()
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 1
+    lines = chunks[0].markdown.split("\n")
+    assert "## 1.1 Introduction" in lines
+    assert "### 1.1.1 Details" in lines
+
+
+def test_italic_hyphenation_integration(tmp_path: Path) -> None:
+    """Prove italic lines that are hyphenated across a line break are joined.
+
+    Relies on PyMuPDF grouping the two italic lines into one text block.
+    If PyMuPDF splits them, this test fails loudly instead of being weakened.
+    """
+    source = tmp_path / "a.pdf"
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text((72, 100), "ana-", fontsize=11, fontname="heit")
+        page.insert_text(
+            (72, 113), "log computer works", fontsize=11, fontname="heit"
+        )
+        page.insert_text(
+            (72, 200),
+            "Body text here to make body size clear.",
+            fontsize=11,
+            fontname="helv",
+        )
+        doc.save(source)
+    finally:
+        doc.close()
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 1
+    md = chunks[0].markdown
+    assert "*analog computer" in md
