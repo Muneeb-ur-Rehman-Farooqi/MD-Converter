@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
+import unicodedata
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -30,10 +32,10 @@ _DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 # - Tables are detected only when ruled lines are present.
 # - Headings are guessed from font-size ratios and section numbering; some
 #   headings will still be missed or mislabelled.
-# - Page furniture (running headers, footers, page numbers) is still not
-#   removed; that is deferred to F6 / F17.
+# - Page furniture is removed by learned style and position. Contents-page
+#   detection is not done yet.
+# - Cross-page paragraph repair is deferred to F6.
 # - Equation handling is Phase 5 (math_hook).
-# - Cross-page hyphenation repair is deferred to F6.
 
 # Ratio thresholds for heading detection. Chosen from real measurements on a
 # 558-page textbook (body 10.0 pt) and deliberately kept as named constants so
@@ -42,6 +44,16 @@ _HEADING_MIN_RATIO = 1.05
 _HEADING_MAX_RATIO = 3.0
 _HEADING_H1_RATIO = 1.6
 _HEADING_H2_RATIO = 1.25
+
+# Furniture thresholds. Chosen from real measurements on a 558-page textbook
+# (header at y0 ~ 22-26 on a 660 pt page, size 9.0, font
+# "HelveticaNeueLTPro-Roman", body 10.0 TimesNewRomanPSStd-Regular) and kept
+# as named constants so they can be tuned when new data disagrees.
+_FURNITURE_ZONE = 0.08
+_FURNITURE_MIN_SHARE = 0.6
+_FURNITURE_MIN_PAGES = 3
+_FURNITURE_MAX_LINES = 2
+_FURNITURE_MAX_CHARS = 100
 
 _BULLET_CHARS = ("•", "●", "▪", "◦", "‣", "∙", "·", "-", "–", "—", "*")
 
@@ -53,6 +65,50 @@ _NUMBERING_PATTERN = re.compile(r"^(\d+(?:\.\d+)*)\.?\s")
 def _round_size(size: float) -> float:
     """Round a font size to the nearest 0.5."""
     return round(size * 2) / 2
+
+
+def _clean_text(text: str) -> str:
+    """Replace every Unicode control character (category Cc) with a space.
+
+    Control characters are junk in Markdown and illegal in XML (a future
+    DOCX writer would reject them), so they must not reach the writer. All
+    other characters pass through untouched: no normalization, no stripping,
+    no escaping.
+    """
+    if not text:
+        return text
+    return "".join(
+        " " if unicodedata.category(ch) == "Cc" else ch for ch in text
+    )
+
+
+def _clean_block(block: dict) -> dict:
+    """Return a copy of block with span texts cleaned of control characters."""
+    new_block = dict(block)
+    new_lines: list[dict] = []
+    for line in block.get("lines", []):
+        new_line = dict(line)
+        new_spans: list[dict] = []
+        for span in line.get("spans", []):
+            new_span = dict(span)
+            new_span["text"] = _clean_text(str(span.get("text", "")))
+            new_spans.append(new_span)
+        new_line["spans"] = new_spans
+        new_lines.append(new_line)
+    new_block["lines"] = new_lines
+    return new_block
+
+
+def _sample_page_numbers(page_count: int) -> list[int]:
+    """Return the sampled 0-based page indices used for typography estimation.
+
+    Up to 20 pages spread evenly across the document: pages 0, step, 2*step,
+    ... below page_count, with step = max(1, page_count // 20).
+    """
+    if page_count <= 0:
+        return []
+    step = max(1, page_count // 20)
+    return list(range(0, page_count, step))[:20]
 
 
 def _estimate_sizes(doc: Any) -> tuple[float | None, list[float]]:
@@ -71,19 +127,15 @@ def _estimate_sizes(doc: Any) -> tuple[float | None, list[float]]:
     page_count = int(doc.page_count)
     if page_count <= 0:
         return None, []
-    step = max(1, page_count // 20)
     char_counts: dict[float, int] = {}
-    sampled = 0
-    for page_index in range(0, page_count, step):
-        if sampled >= 20:
-            break
-        sampled += 1
+    for page_index in _sample_page_numbers(page_count):
         page = doc[page_index]
         data = page.get_text("dict", flags=_DICT_FLAGS)
         for block in data.get("blocks", []):
             if block.get("type") != 0:
                 continue
-            for line in block.get("lines", []):
+            cleaned = _clean_block(block)
+            for line in cleaned.get("lines", []):
                 for span in line.get("spans", []):
                     text = str(span.get("text", ""))
                     if not text.strip():
@@ -155,6 +207,143 @@ def _heading_level(size: float, body_size: float, text: str) -> int | None:
     if ratio >= _HEADING_H2_RATIO:
         return 2
     return 3
+
+
+def _block_signature(
+    block: dict, page_height: float
+) -> tuple[str, float, str] | None:
+    """Return (zone, dominant rounded size, dominant font) for a text block.
+
+    Returns None when the block is blank, has more than
+    _FURNITURE_MAX_LINES non-blank lines, has more than
+    _FURNITURE_MAX_CHARS characters in total (sum of the stripped non-blank
+    line lengths), or does not fall in the top or bottom _FURNITURE_ZONE
+    band of the page.
+    """
+    if page_height <= 0:
+        return None
+    bbox = block.get("bbox")
+    if not bbox:
+        return None
+
+    size_counts: dict[float, int] = {}
+    font_counts: dict[str, int] = {}
+    non_blank_lines = 0
+    total_chars = 0
+    for line in block.get("lines", []):
+        line_text = ""
+        for span in line.get("spans", []):
+            text = _clean_text(str(span.get("text", "")))
+            line_text += text
+            if not text.strip():
+                continue
+            key = _round_size(float(span.get("size", 0.0)))
+            size_counts[key] = size_counts.get(key, 0) + len(text)
+            font = str(span.get("font", ""))
+            font_counts[font] = font_counts.get(font, 0) + len(text)
+        stripped = line_text.strip()
+        if stripped:
+            non_blank_lines += 1
+            total_chars += len(stripped)
+
+    if non_blank_lines == 0:
+        return None
+    if non_blank_lines > _FURNITURE_MAX_LINES:
+        return None
+    if total_chars > _FURNITURE_MAX_CHARS:
+        return None
+
+    y0 = float(bbox[1])
+    y1 = float(bbox[3])
+    if y0 < page_height * _FURNITURE_ZONE:
+        zone = "top"
+    elif y1 > page_height * (1 - _FURNITURE_ZONE):
+        zone = "bottom"
+    else:
+        return None
+
+    if not size_counts:
+        return None
+    dominant_size = max(size_counts.items(), key=lambda item: item[1])[0]
+    dominant_font = max(font_counts.items(), key=lambda item: item[1])[0]
+    return (zone, dominant_size, dominant_font)
+
+
+def _learn_furniture(doc: Any) -> list[tuple[str, float, str]]:
+    """Learn recurring page-furniture styles from the sampled pages.
+
+    Returns the signatures (zone, size, font) that appear on at least
+    max(_FURNITURE_MIN_PAGES, ceil(_FURNITURE_MIN_SHARE * pages_with_text))
+    sampled pages that contain text, and whose (size, font) differs from the
+    document's body style. Sorted for determinism.
+    """
+    page_count = int(doc.page_count)
+    if page_count <= 0:
+        return []
+
+    style_counts: dict[tuple[float, str], int] = {}
+    page_signatures: list[set[tuple[str, float, str]]] = []
+
+    for page_index in _sample_page_numbers(page_count):
+        try:
+            page = doc[page_index]
+            data = page.get_text("dict", flags=_DICT_FLAGS)
+        except Exception:
+            logger.debug(
+                "Skipping page %d for furniture learning", page_index
+            )
+            continue
+        page_height = float(data.get("height", 0.0))
+        has_text = False
+        sigs: set[tuple[str, float, str]] = set()
+        for raw_block in data.get("blocks", []):
+            if raw_block.get("type") != 0:
+                continue
+            block = _clean_block(raw_block)
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = str(span.get("text", ""))
+                    if not text.strip():
+                        continue
+                    has_text = True
+                    size = _round_size(float(span.get("size", 0.0)))
+                    font = str(span.get("font", ""))
+                    style_counts[(size, font)] = (
+                        style_counts.get((size, font), 0) + len(text)
+                    )
+            sig = _block_signature(block, page_height)
+            if sig is not None:
+                sigs.add(sig)
+        if has_text:
+            page_signatures.append(sigs)
+
+    pages_with_text = len(page_signatures)
+    if pages_with_text < _FURNITURE_MIN_PAGES:
+        return []
+
+    body_style: tuple[float, str] | None = None
+    if style_counts:
+        body_style = max(style_counts.items(), key=lambda item: item[1])[0]
+
+    threshold = max(
+        _FURNITURE_MIN_PAGES,
+        math.ceil(_FURNITURE_MIN_SHARE * pages_with_text),
+    )
+
+    signature_page_counts: dict[tuple[str, float, str], int] = {}
+    for sigs in page_signatures:
+        for sig in sigs:
+            signature_page_counts[sig] = signature_page_counts.get(sig, 0) + 1
+
+    qualifying: list[tuple[str, float, str]] = []
+    for sig, count in signature_page_counts.items():
+        if count < threshold:
+            continue
+        if body_style is not None and (sig[1], sig[2]) == body_style:
+            continue
+        qualifying.append(sig)
+
+    return sorted(qualifying)
 
 
 def _table_to_markdown(rows: list[list[str | None]]) -> str:
@@ -421,7 +610,12 @@ def _format_block(block: dict, body_size: float | None) -> str:
     return "\n".join(parts)
 
 
-def read(path: Path, *, detect_tables: bool = True) -> Iterator[Chunk]:
+def read(
+    path: Path,
+    *,
+    detect_tables: bool = True,
+    strip_furniture: bool = True,
+) -> Iterator[Chunk]:
     """Yield one Chunk per non-empty page of the PDF at path.
 
     Generator: the file is not opened until iteration begins, and the
@@ -446,14 +640,20 @@ def read(path: Path, *, detect_tables: bool = True) -> Iterator[Chunk]:
         # Only the body size is used now; the heading-size list is kept in
         # the helper's return value for scripts/inspect_fonts.py.
         body_size, _unused_heading_sizes = _estimate_sizes(doc)
+
+        furniture: set[tuple[str, float, str]] = set()
+        if strip_furniture:
+            furniture = set(_learn_furniture(doc))
+
         pages_skipped = 0
         chunks_emitted = 0
 
         for n in range(doc.page_count):
             page = doc[n]
             data = page.get_text("dict", flags=_DICT_FLAGS)
+            page_height = float(data.get("height", 0.0))
             text_blocks = [
-                block
+                _clean_block(block)
                 for block in data.get("blocks", [])
                 if block.get("type") == 0
             ]
@@ -474,7 +674,14 @@ def read(path: Path, *, detect_tables: bool = True) -> Iterator[Chunk]:
                         if table.row_count < 2 or table.col_count < 2:
                             continue
                         rows = table.extract()
-                        md = _table_to_markdown(rows)
+                        cleaned_rows: list[list[str | None]] = [
+                            [
+                                _clean_text(cell) if cell is not None else None
+                                for cell in row
+                            ]
+                            for row in rows
+                        ]
+                        md = _table_to_markdown(cleaned_rows)
                         if not md:
                             continue
                         bbox = tuple(float(v) for v in table.bbox)
@@ -491,6 +698,10 @@ def read(path: Path, *, detect_tables: bool = True) -> Iterator[Chunk]:
             emitted_tables: set[int] = set()
             block_outputs: list[str] = []
             for block in text_blocks:
+                if furniture:
+                    sig = _block_signature(block, page_height)
+                    if sig is not None and sig in furniture:
+                        continue
                 table_index = _find_containing_table(block, accepted_tables)
                 if table_index is not None:
                     if table_index not in emitted_tables:

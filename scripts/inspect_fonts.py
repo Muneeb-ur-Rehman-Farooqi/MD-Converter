@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import argparse
 import sys
+import unicodedata
 from pathlib import Path
 
 import pymupdf
 
-from md_converter.core.readers.pdf_reader import _estimate_sizes
+from md_converter.core.readers.pdf_reader import (
+    _estimate_sizes,
+    _learn_furniture,
+)
 
 _DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 
@@ -24,6 +28,21 @@ _DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 def _round_size(size: float) -> float:
     """Round a font size to the nearest 0.5."""
     return round(size * 2) / 2
+
+
+def _visible(text: str) -> str:
+    """Replace control characters with "<0xNN>" for safe console output.
+
+    A backspace character once erased the previous letter on the Windows
+    console and hid the real PDF content from us, so every Cc character is
+    shown as an explicit two-hex-digit token instead.
+    """
+    if not text:
+        return text
+    return "".join(
+        f"<0x{ord(ch):02X}>" if unicodedata.category(ch) == "Cc" else ch
+        for ch in text
+    )
 
 
 def _parse_page_spec(value: str) -> list[int]:
@@ -173,7 +192,9 @@ def _print_page(doc: object, page_number: int) -> None:
         line_count = _non_blank_line_count(block)
         y0 = round(_y0(block))
         size_text = f"{size:>6.1f}" if size is not None else f"{'n/a':>6}"
-        preview = _block_preview(block)
+        # Pass the preview through _visible so a stray Cc character cannot
+        # hide the real content on the console.
+        preview = _visible(_block_preview(block))
         print(
             f"{visible_index:>3}  {y0:>6}  {line_count:>5}  {size_text}  "
             f"{bold_flag:>1}  {font:<24}  {preview}"
@@ -286,6 +307,16 @@ def main(argv: list[str] | None = None) -> int:
             f"{pdf_path.name} | pages: {page_count} | "
             f"body size: {body_text} | heading sizes: {headings_text}"
         )
+
+        furniture = _learn_furniture(doc)
+        if furniture:
+            styles_text = ", ".join(
+                f"({zone}, {size:.1f}, {font})"
+                for zone, size, font in furniture
+            )
+            print(f"furniture styles: [{styles_text}]")
+        else:
+            print("furniture styles: none")
 
         for page_number in requested:
             print()

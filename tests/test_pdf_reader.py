@@ -24,13 +24,16 @@ from md_converter.core.models import (
 from md_converter.core.pipeline import Pipeline
 from md_converter.core.readers import pdf_reader
 from md_converter.core.readers.pdf_reader import (
+    _block_signature,
     _bullet_to_markdown,
+    _clean_text,
     _collapse_letter_spacing,
     _heading_level,
     _join_block_lines,
     _join_line_spans,
     _numbering_depth,
     _round_size,
+    _sample_page_numbers,
     _spans_to_markdown,
     _table_to_markdown,
 )
@@ -126,6 +129,33 @@ def _make_encrypted_pdf(path: Path) -> None:
             user_pw="secret",
             owner_pw="owner",
         )
+    finally:
+        doc.close()
+
+
+def _make_header_footer_pdf(
+    path: Path, pages: list[tuple[str | None, list[str]]]
+) -> None:
+    """Create a PDF with an optional header at (72, 36) 9pt and body lines.
+
+    pages is a list of (header_text_or_None, body_lines) per page. Body
+    lines start at y=120 and use fontsize 11 helv.
+    """
+    doc = pymupdf.open()
+    try:
+        for header, body_lines in pages:
+            page = doc.new_page()
+            if header is not None:
+                page.insert_text(
+                    (72, 36), header, fontsize=9, fontname="helv"
+                )
+            y = 120
+            for line in body_lines:
+                page.insert_text(
+                    (72, y), line, fontsize=11, fontname="helv"
+                )
+                y += 16
+        doc.save(path)
     finally:
         doc.close()
 
@@ -240,7 +270,7 @@ def test_spans_to_markdown_merges_consecutive_bold_spans() -> None:
     assert _spans_to_markdown(spans) == "**foobar**"
 
 
-# --------------------- new pure helpers (heading design) ------------------- #
+# --------------------- heading design pure helpers ------------------------- #
 
 
 def test_numbering_depth() -> None:
@@ -275,7 +305,7 @@ def test_heading_level_with_body_size_10() -> None:
     assert _heading_level(9.0, 10.0, "Preface xi") is None
 
 
-# ------------------ new pure helpers (emphasis merge design) --------------- #
+# ------------------ emphasis merge design pure helpers --------------------- #
 
 
 def test_join_line_spans_italic_hyphenation() -> None:
@@ -333,6 +363,186 @@ def test_join_line_spans_does_not_mutate_input() -> None:
     original = copy.deepcopy(lines)
     _join_line_spans(lines)
     assert lines == original
+
+
+# ------------------- control-character pure helpers ------------------------ #
+
+
+def test_clean_text() -> None:
+    """Prove _clean_text turns Cc characters into spaces and leaves the rest."""
+    assert _clean_text("Preface\x08") == "Preface "
+    assert _clean_text("a\tb") == "a b"
+    assert _clean_text("x\x00y") == "x y"
+    assert _clean_text("café ∑ α ≤") == "café ∑ α ≤"
+    assert _clean_text("") == ""
+
+
+# ------------------- furniture pure helpers -------------------------------- #
+
+
+def test_sample_page_numbers() -> None:
+    """Prove _sample_page_numbers matches the old even-spread sampling."""
+    assert _sample_page_numbers(5) == [0, 1, 2, 3, 4]
+    assert _sample_page_numbers(1) == [0]
+    result = _sample_page_numbers(558)
+    assert result[0] == 0
+    assert all(0 <= n < 558 for n in result)
+    assert result == sorted(result)
+    assert len(result) == len(set(result))
+    assert len(result) <= 21
+
+
+def test_block_signature_top_zone() -> None:
+    """Prove a one-line block in the top zone gives a top signature."""
+    block = {
+        "type": 0,
+        "bbox": (72, 20, 300, 32),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": "Preface xi",
+                        "size": 9.0,
+                        "font": "Helv",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) == ("top", 9.0, "Helv")
+
+
+def test_block_signature_middle_zone_returns_none() -> None:
+    """Prove a block in the middle of the page gives no signature."""
+    block = {
+        "type": 0,
+        "bbox": (72, 300, 300, 320),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": "Body text",
+                        "size": 11.0,
+                        "font": "Times",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) is None
+
+
+def test_block_signature_bottom_zone() -> None:
+    """Prove a block near the bottom of the page gives a bottom signature."""
+    block = {
+        "type": 0,
+        "bbox": (72, 630, 300, 640),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": "page number",
+                        "size": 9.0,
+                        "font": "Helv",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) == ("bottom", 9.0, "Helv")
+
+
+def test_block_signature_too_many_lines_returns_none() -> None:
+    """Prove a 3-line block in the top zone gives no signature."""
+    lines = [
+        {
+            "spans": [
+                {
+                    "text": f"line {i}",
+                    "size": 9.0,
+                    "font": "Helv",
+                    "flags": 0,
+                }
+            ]
+        }
+        for i in range(3)
+    ]
+    block = {"type": 0, "bbox": (72, 20, 300, 60), "lines": lines}
+    assert _block_signature(block, 660.0) is None
+
+
+def test_block_signature_too_many_chars_returns_none() -> None:
+    """Prove a top-zone block with more than 100 characters gives no signature."""
+    text = "a" * 101
+    block = {
+        "type": 0,
+        "bbox": (72, 20, 500, 32),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": text,
+                        "size": 9.0,
+                        "font": "Helv",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) is None
+
+
+def test_block_signature_blank_returns_none() -> None:
+    """Prove a blank block gives no signature."""
+    block = {
+        "type": 0,
+        "bbox": (72, 20, 300, 32),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": "   ",
+                        "size": 9.0,
+                        "font": "Helv",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) is None
+
+
+def test_block_signature_cleans_control_chars() -> None:
+    """Prove _block_signature counts cleaned text, not raw control chars.
+
+    The span is 100 'a's + one backspace: 101 characters raw. Cleaned the
+    backspace becomes a space which is stripped, leaving exactly 100, which
+    is not > 100 so a signature is returned. Without cleaning the block
+    would be rejected as having 101 characters.
+    """
+    text = "a" * 100 + "\x08"
+    block = {
+        "type": 0,
+        "bbox": (72, 20, 500, 32),
+        "lines": [
+            {
+                "spans": [
+                    {
+                        "text": text,
+                        "size": 9.0,
+                        "font": "Helv",
+                        "flags": 0,
+                    }
+                ]
+            }
+        ],
+    }
+    assert _block_signature(block, 660.0) == ("top", 9.0, "Helv")
 
 
 # ----------------------------- reader tests -------------------------------- #
@@ -541,11 +751,11 @@ def test_end_to_end_pipeline_blank_pdf_fails_with_ocr_message(
     assert "OCR" in result.error_message
 
 
-# ------------------------- new integration tests --------------------------- #
+# --------------------- heading integration tests --------------------------- #
 
 
 def test_numbering_headings_are_detected(tmp_path: Path) -> None:
-    """Prove section-numbered headings produce #, ## and ### lines."""
+    """Prove section-numbered headings produce ## and ### lines."""
     source = tmp_path / "a.pdf"
     doc = pymupdf.open()
     try:
@@ -604,3 +814,109 @@ def test_italic_hyphenation_integration(tmp_path: Path) -> None:
     assert len(chunks) == 1
     md = chunks[0].markdown
     assert "*analog computer" in md
+
+
+# --------------------- furniture integration tests ------------------------- #
+
+
+def test_furniture_removed_from_markdown_but_kept_in_raw_text(
+    tmp_path: Path,
+) -> None:
+    """Prove learned running headers are removed from markdown but kept in raw_text."""
+    source = tmp_path / "book.pdf"
+    pages: list[tuple[str | None, list[str]]] = []
+    for n in range(1, 11):
+        body = [
+            f"Body sentence number {n} line {k}" for k in range(1, 8)
+        ]
+        pages.append((f"Chapter Title {n}", body))
+    _make_header_footer_pdf(source, pages)
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 10
+    for chunk, n in zip(chunks, range(1, 11)):
+        assert f"Chapter Title {n}" not in chunk.markdown
+        assert f"Body sentence number {n}" in chunk.markdown
+        assert f"Chapter Title {n}" in chunk.raw_text
+
+
+def test_furniture_disabled_keeps_headers(tmp_path: Path) -> None:
+    """Prove strip_furniture=False keeps the running headers in markdown."""
+    source = tmp_path / "book.pdf"
+    pages: list[tuple[str | None, list[str]]] = []
+    for n in range(1, 11):
+        body = [
+            f"Body sentence number {n} line {k}" for k in range(1, 8)
+        ]
+        pages.append((f"Chapter Title {n}", body))
+    _make_header_footer_pdf(source, pages)
+
+    chunks = list(pdf_reader.read(source, strip_furniture=False))
+    assert len(chunks) == 10
+    for chunk, n in zip(chunks, range(1, 11)):
+        assert f"Chapter Title {n}" in chunk.markdown
+
+
+def test_two_page_pdf_keeps_headers(tmp_path: Path) -> None:
+    """Prove fewer than _FURNITURE_MIN_PAGES pages with text does not learn furniture."""
+    source = tmp_path / "small.pdf"
+    pages: list[tuple[str | None, list[str]]] = [
+        ("Chapter Title 1", [f"Body {k}" for k in range(1, 8)]),
+        ("Chapter Title 2", [f"Body {k}" for k in range(1, 8)]),
+    ]
+    _make_header_footer_pdf(source, pages)
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 2
+    assert "Chapter Title 1" in chunks[0].markdown
+    assert "Chapter Title 2" in chunks[1].markdown
+
+
+def test_header_on_only_two_pages_is_kept(tmp_path: Path) -> None:
+    """Prove a header on only 2 of 10 pages is not learned as furniture."""
+    source = tmp_path / "book.pdf"
+    pages: list[tuple[str | None, list[str]]] = []
+    for n in range(1, 11):
+        header = f"Chapter Title {n}" if n <= 2 else None
+        body = [
+            f"Body sentence number {n} line {k}" for k in range(1, 8)
+        ]
+        pages.append((header, body))
+    _make_header_footer_pdf(source, pages)
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 10
+    assert "Chapter Title 1" in chunks[0].markdown
+    assert "Chapter Title 2" in chunks[1].markdown
+
+
+def test_header_same_style_as_body_is_kept(tmp_path: Path) -> None:
+    """Prove a header whose size/font equals the body style is not removed."""
+    source = tmp_path / "book.pdf"
+    doc = pymupdf.open()
+    try:
+        for n in range(1, 11):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 36),
+                f"Chapter Title {n}",
+                fontsize=11,
+                fontname="helv",
+            )
+            y = 120
+            for k in range(1, 8):
+                page.insert_text(
+                    (72, y),
+                    f"Body sentence number {n} line {k}",
+                    fontsize=11,
+                    fontname="helv",
+                )
+                y += 16
+        doc.save(source)
+    finally:
+        doc.close()
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 10
+    for chunk, n in zip(chunks, range(1, 11)):
+        assert f"Chapter Title {n}" in chunk.markdown
