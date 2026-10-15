@@ -31,6 +31,7 @@ from md_converter.core.readers.pdf_reader import (
     _heading_level,
     _join_block_lines,
     _join_line_spans,
+    _learn_furniture,
     _numbering_depth,
     _round_size,
     _sample_page_numbers,
@@ -155,6 +156,29 @@ def _make_header_footer_pdf(
                     (72, y), line, fontsize=11, fontname="helv"
                 )
                 y += 16
+        doc.save(path)
+    finally:
+        doc.close()
+
+
+def _make_slide_pdf(path: Path, page_count: int = 8) -> None:
+    """Create a slide-like PDF: 24pt title and 14pt body lines on every page."""
+    doc = pymupdf.open()
+    try:
+        for n in range(1, page_count + 1):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 36), f"Slide Title {n}", fontsize=24, fontname="helv"
+            )
+            y = 140
+            for k in range(1, 8):
+                page.insert_text(
+                    (72, y),
+                    f"Slide body line {k} of page {n}",
+                    fontsize=14,
+                    fontname="helv",
+                )
+                y += 24
         doc.save(path)
     finally:
         doc.close()
@@ -920,3 +944,56 @@ def test_header_same_style_as_body_is_kept(tmp_path: Path) -> None:
     assert len(chunks) == 10
     for chunk, n in zip(chunks, range(1, 11)):
         assert f"Chapter Title {n}" in chunk.markdown
+
+
+# --------------------- design-review size-threshold tests ------------------ #
+
+
+def test_slide_titles_are_kept_in_markdown(tmp_path: Path) -> None:
+    """Prove a 24pt title over a 14pt body is not treated as furniture."""
+    source = tmp_path / "slides.pdf"
+    _make_slide_pdf(source, 8)
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 8
+    for chunk, n in zip(chunks, range(1, 9)):
+        assert f"Slide Title {n}" in chunk.markdown
+        for k in range(1, 8):
+            assert f"Slide body line {k} of page {n}" in chunk.markdown
+
+
+def test_learn_furniture_returns_empty_for_slides(tmp_path: Path) -> None:
+    """Prove _learn_furniture ignores a repeating style bigger than the body."""
+    source = tmp_path / "slides.pdf"
+    _make_slide_pdf(source, 8)
+    with pymupdf.open(source) as doc:
+        assert _learn_furniture(doc) == []
+
+
+def test_header_slightly_bigger_than_body_is_kept(tmp_path: Path) -> None:
+    """Prove a 12pt header over an 11pt body is not removed as furniture."""
+    source = tmp_path / "book.pdf"
+    doc = pymupdf.open()
+    try:
+        for n in range(1, 11):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 36), f"Running {n}", fontsize=12, fontname="helv"
+            )
+            y = 120
+            for k in range(1, 8):
+                page.insert_text(
+                    (72, y),
+                    f"Body sentence number {n} line {k}",
+                    fontsize=11,
+                    fontname="helv",
+                )
+                y += 16
+        doc.save(source)
+    finally:
+        doc.close()
+
+    chunks = list(pdf_reader.read(source))
+    assert len(chunks) == 10
+    for chunk, n in zip(chunks, range(1, 11)):
+        assert f"Running {n}" in chunk.markdown

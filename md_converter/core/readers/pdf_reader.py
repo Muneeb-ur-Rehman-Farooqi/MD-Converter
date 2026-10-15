@@ -32,8 +32,10 @@ _DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 # - Tables are detected only when ruled lines are present.
 # - Headings are guessed from font-size ratios and section numbering; some
 #   headings will still be missed or mislabelled.
-# - Page furniture is removed by learned style and position. Contents-page
-#   detection is not done yet.
+# - Page furniture is removed by learned style and position. Only a
+#   recurring top/bottom style whose size is at or below the body size
+#   (times _FURNITURE_MAX_SIZE_RATIO) counts as furniture; clearly bigger
+#   styles are treated as content. Contents-page detection is not done yet.
 # - Cross-page paragraph repair is deferred to F6.
 # - Equation handling is Phase 5 (math_hook).
 
@@ -54,6 +56,12 @@ _FURNITURE_MIN_SHARE = 0.6
 _FURNITURE_MIN_PAGES = 3
 _FURNITURE_MAX_LINES = 2
 _FURNITURE_MAX_CHARS = 100
+
+# Real running headers and footers are the same size as the body or smaller
+# (measured: 9.0 pt header over 10.0 pt body). A repeating top-or-bottom style
+# that is clearly bigger than the body is content (a title or heading), never
+# furniture. Comes from the design review and is tunable.
+_FURNITURE_MAX_SIZE_RATIO = 1.05
 
 _BULLET_CHARS = ("•", "●", "▪", "◦", "‣", "∙", "·", "-", "–", "—", "*")
 
@@ -274,8 +282,11 @@ def _learn_furniture(doc: Any) -> list[tuple[str, float, str]]:
 
     Returns the signatures (zone, size, font) that appear on at least
     max(_FURNITURE_MIN_PAGES, ceil(_FURNITURE_MIN_SHARE * pages_with_text))
-    sampled pages that contain text, and whose (size, font) differs from the
-    document's body style. Sorted for determinism.
+    sampled pages that contain text, whose (size, font) differs from the
+    document's body style, and whose size is not bigger than the body size
+    times _FURNITURE_MAX_SIZE_RATIO. A repeating style that is clearly bigger
+    than the body is content (a slide title or heading), never furniture.
+    Sorted for determinism.
     """
     page_count = int(doc.page_count)
     if page_count <= 0:
@@ -340,6 +351,11 @@ def _learn_furniture(doc: Any) -> list[tuple[str, float, str]]:
         if count < threshold:
             continue
         if body_style is not None and (sig[1], sig[2]) == body_style:
+            continue
+        if (
+            body_style is not None
+            and sig[1] > body_style[0] * _FURNITURE_MAX_SIZE_RATIO
+        ):
             continue
         qualifying.append(sig)
 
